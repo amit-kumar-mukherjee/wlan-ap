@@ -27,6 +27,7 @@
 #include "ovsdb_sync.h"
 #include "rrm_config.h"
 #include "fixup.h"
+#include <libubox/blobmsg_json.h>
 
 #define MODULE_ID LOG_MODULE_ID_VIF
 #define UCI_BUFFER_SIZE 80
@@ -138,6 +139,7 @@ enum {
 	WIF_ATTR_PROXY_ARP,
 	WIF_ATTR_MCAST_TO_UCAST,
 	WIF_ATTR_AUTH_CACHE,
+	WIF_ATTR_WDS,
 	__WIF_ATTR_MAX,
 };
 
@@ -236,6 +238,7 @@ static const struct blobmsg_policy wifi_iface_policy[__WIF_ATTR_MAX] = {
 	[WIF_ATTR_PROXY_ARP] = { .name = "proxy_arp", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_MCAST_TO_UCAST] = { .name = "multicast_to_unicast", BLOBMSG_TYPE_BOOL },
 	[WIF_ATTR_AUTH_CACHE] = { .name = "auth_cache", BLOBMSG_TYPE_BOOL },
+	[WIF_ATTR_WDS] = { .name = "wds", BLOBMSG_TYPE_BOOL },
 };
 
 const struct uci_blob_param_list wifi_iface_param = {
@@ -909,10 +912,21 @@ bool vif_state_update(struct uci_section *s, struct schema_Wifi_VIF_Config *vcon
 	else
 		SCHEMA_SET_STR(vstate.ssid_broadcast, "enabled");
 
-	if (tb[WIF_ATTR_MODE])
+	if (tb[WIF_ATTR_WDS] && blobmsg_get_bool(tb[WIF_ATTR_WDS])) {
+		if (tb[WIF_ATTR_MODE]) {
+			if (!strcmp(blobmsg_get_string(tb[WIF_ATTR_MODE]), "sta")) {
+				SCHEMA_SET_STR(vstate.mode, "wds-sta");
+			} else {
+				SCHEMA_SET_STR(vstate.mode, "wds-ap");
+			}
+		} else {
+			SCHEMA_SET_STR(vstate.mode, "wds-ap");
+		}
+	} else if (tb[WIF_ATTR_MODE]) {
 		SCHEMA_SET_STR(vstate.mode, blobmsg_get_string(tb[WIF_ATTR_MODE]));
-	else
+	} else {
 		SCHEMA_SET_STR(vstate.mode, "ap");
+	}
 
 	if (vifIsActive)
 		SCHEMA_SET_STR(vstate.state, "up");
@@ -1503,7 +1517,7 @@ static void vif_mesh_opt_set(struct blob_buf *b, struct blob_buf *b1,
 	}
 }
 
-static int mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+int mesh_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 			const struct schema_Wifi_VIF_Config *vconf,
 			const struct schema_Wifi_VIF_Config_flags *changed)
 {
@@ -1547,7 +1561,8 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	blobmsg_add_string(&b, "ifname", vconf->if_name);
 	blobmsg_add_string(&b, "device", rconf->if_name);
 	blobmsg_add_string(&b, "mode", "ap");
-
+	blobmsg_add_bool(&del, "wds", 1);
+ 
 	if (changed->enabled)
 		blobmsg_add_bool(&b, "disabled", vconf->enabled ? 0 : 1);
 
@@ -1655,17 +1670,165 @@ static int ap_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
 	return 0;
 }
 
+#define WDS_FILENAME "/etc/wds-sta-config.json"
+
+static int vif_backup_wds_sta_config(struct blob_buf *b)
+{ 
+	FILE *fd;
+	char *jsonTxt;
+
+	fd = fopen(WDS_FILENAME, "w");
+	if (fd) {
+		jsonTxt = blobmsg_format_json(b->head, true);
+		fprintf(fd, "%s", jsonTxt);
+		fclose(fd);
+		free(jsonTxt);
+	} else {
+                LOGI("%s: Failed to back-up WDS-STA config.", __FUNCTION__);
+	}
+	return 0;
+}
+
+int vif_restore_wds_sta_config(struct blob_buf *b)
+{
+	FILE *fd;
+	struct stat st;
+	char *jsonTxt;
+
+        fd = fopen(WDS_FILENAME, "r");
+        if (fd) {
+	        stat(WDS_FILENAME, &st);
+		jsonTxt = malloc(st.st_size+1);
+		if (!jsonTxt)	{
+			fclose(fd);
+			LOGI("%s: Failed to restore WDS-STA config (malloc).", __FUNCTION__);
+			return -1;
+		}
+		fscanf(fd,"%s", jsonTxt);
+                blobmsg_add_json_from_string(b, jsonTxt);
+                fclose(fd);
+                free(jsonTxt);
+        } else {
+                LOGI("%s: Failed to restore WDS-STA config (file).", __FUNCTION__);
+		return -1;
+        }
+        return 0;
+}
+ 	
+static int wds_vif_config_set(const struct schema_Wifi_Radio_Config *rconf,
+			const struct schema_Wifi_VIF_Config *vconf,
+			const struct schema_Wifi_VIF_Config_flags *changed)
+{
+	int vid = 0;
+
+	blob_buf_init(&b, 0);
+	blob_buf_init(&del,0);
+	blobmsg_add_string(&b, "ifname", vconf->if_name);
+	blobmsg_add_string(&b, "device", rconf->if_name);
+        if (!strcmp(vconf->mode, "wds-ap")) {
+                blobmsg_add_string(&b, "mode", "ap");
+                blobmsg_add_bool(&b, "wds", 1);
+        } else if (!strcmp(vconf->mode, "wds-sta")) {
+                blobmsg_add_string(&b, "mode", "sta");
+                blobmsg_add_bool(&b, "wds", 1);
+        } else {
+                return -1;
+        }
+
+	blobmsg_add_bool(&b, "disabled", vconf->enabled ? 0 : 1);
+	blobmsg_add_string(&b, "ssid", vconf->ssid);
+	if (!strcmp(vconf->ssid_broadcast, "disabled"))
+		blobmsg_add_bool(&b, "hidden", 1);
+	else
+		blobmsg_add_bool(&b, "hidden", 0);
+	if (vconf->ap_bridge)
+		blobmsg_add_bool(&b, "isolate", 0);
+	else
+		blobmsg_add_bool(&b, "isolate", 1);
+	if (vconf->uapsd_enable)
+		blobmsg_add_bool(&b, "uapsd", 1);
+	else
+		blobmsg_add_bool(&b, "uapsd", 0);
+	blobmsg_add_string(&b, "min_hw_mode", vconf->min_hw_mode);
+
+	if (vconf->ft_mobility_domain) {
+		blobmsg_add_bool(&b, "ieee80211r", 1);
+		blobmsg_add_hex16(&b, "mobility_domain", vconf->ft_mobility_domain);
+		blobmsg_add_bool(&b, "ft_over_ds", 0);
+		blobmsg_add_bool(&b, "reassociation_deadline", 1);
+	} else {
+		blobmsg_add_bool(&b, "ieee80211r", 0);
+	}
+	if (vconf->btm) {
+		blobmsg_add_bool(&b, "ieee80211v", 1);
+		blobmsg_add_bool(&b, "bss_transition", 1);
+	} else {
+		blobmsg_add_bool(&b, "ieee80211v", 0);
+		blobmsg_add_bool(&b, "bss_transition", 0);
+	}
+	blobmsg_add_string(&b, "network", vconf->bridge);
+
+	if (changed->vlan_id && strncmp(vconf->bridge, "gre", strlen("gre"))) {
+		blobmsg_add_u32(&b, "vlan_id", vconf->vlan_id);
+		if (vconf->vlan_id > 2)
+			vid = vconf->vlan_id;
+		blobmsg_add_u32(&b, "vid", vid);
+	}
+
+	if (changed->mac_list_type) {
+		struct blob_attr *a;
+		int i;
+		if (!strcmp(vconf->mac_list_type, "whitelist"))
+			blobmsg_add_string(&b, "macfilter", "allow");
+		else if (!strcmp(vconf->mac_list_type,"blacklist"))
+			blobmsg_add_string(&b, "macfilter", "deny");
+		else
+			blobmsg_add_string(&b, "macfilter", "disable");
+
+		a = blobmsg_open_array(&b, "maclist");
+		for (i = 0; i < vconf->mac_list_len; i++)
+			blobmsg_add_string(&b, NULL, (char*)vconf->mac_list[i]);
+		blobmsg_close_array(&b, a);
+	}
+
+	blobmsg_add_bool(&b, "wpa_disable_eapol_key_retries", 1);
+	blobmsg_add_u32(&b, "channel", rconf->channel);
+
+	if (vif_config_security_set(&b, vconf))
+		return -1;
+
+	if (changed->custom_options)
+		vif_config_custom_opt_set(&b, &del, vconf);
+
+	rrm_config_vif(&b, &del, rconf->freq_band, vconf->if_name);
+
+	blob_to_uci_section(uci, "wireless", vconf->if_name, "wifi-iface",
+			    b.head, &wifi_iface_param, del.head);
+
+	if (vid)
+		vlan_add((char *)vconf->if_name, vid, !strcmp(vconf->bridge, "wan"));
+	else
+		vlan_del((char *)vconf->if_name);
+
+	uci_commit_all(uci);
+
+	if (!strcmp(vconf->mode, "wds-sta")) 
+		vif_backup_wds_sta_config(&b);
+	return 0;
+}
+
 bool target_vif_config_set2(const struct schema_Wifi_VIF_Config *vconf,
 			const struct schema_Wifi_Radio_Config *rconf,
 			const struct schema_Wifi_Credential_Config *cconfs,
 			const struct schema_Wifi_VIF_Config_flags *changed,
 			int num_cconfs)
 {
-	int rc;
 	if (!strcmp(vconf->mode, "mesh")) {
-		rc = mesh_vif_config_set(rconf, vconf, changed);
-	} else {
-		rc = ap_vif_config_set(rconf, vconf, changed);
+		(void) mesh_vif_config_set(rconf, vconf, changed);
+	} else if ((!strcmp(vconf->mode, "wds-ap")) || (!strcmp(vconf->mode, "wds-sta"))) {
+                (void) wds_vif_config_set(rconf, vconf, changed);
+        } else {
+		(void) ap_vif_config_set(rconf, vconf, changed);
 	}
 
 	return true;
